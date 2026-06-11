@@ -435,7 +435,7 @@ export default function Home() {
           className={`mb-3 flex touch-none select-none items-center justify-between px-1 sm:mb-5 ${isDesktop ? "cursor-grab active:cursor-grabbing" : ""}`}
         >
           <span className="text-xs font-semibold uppercase tracking-[0.3em] text-amber-500/80">
-            Tactile
+            Casio
           </span>
           <div className="flex gap-1">
             <span className="h-1 w-1 rounded-full bg-white/15" />
