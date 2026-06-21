@@ -75,6 +75,15 @@ function solveQuadratic(a: number, b: number, c: number): string {
   return `x = ${x1}, ${x2}`;
 }
 
+// Render ax² + bx + c with the coefficients substituted in and the signs
+// tidied up, e.g. (2, -3, 1) → "2x² − 3x + 1". Uses the same minus glyph as
+// the keypad so it matches the rest of the UI.
+function formatQuadExpr(a: number, b: number, c: number): string {
+  const bSign = b < 0 ? "−" : "+";
+  const cSign = c < 0 ? "−" : "+";
+  return `${format(a)}x² ${bSign} ${format(Math.abs(b))}x ${cSign} ${format(Math.abs(c))}`;
+}
+
 // Pure function: given the current state and a key, return the NEXT state.
 // It never reads anything outside its arguments, which is what makes the
 // keyboard wiring below safe and simple.
@@ -126,6 +135,9 @@ const STORAGE_KEY = "calc.history";
 
 // Quadratic history lives in its own slot, same last-10 limit.
 const STORAGE_KEY_QUAD = "calc.quadHistory";
+
+// Function-tab history (logs, exponents, Euler's number) — its own slot too.
+const STORAGE_KEY_FUNC = "calc.funcHistory";
 
 // The whole app's state: the calculator plus a log of completed calculations.
 type AppState = {
@@ -266,6 +278,23 @@ export default function Home() {
   const [coeffs, setCoeffs] = useState({ a: "", b: "", c: "" });
   const [roots, setRoots] = useState<string | null>(null);
   const [quadHistory, setQuadHistory] = useState<string[]>([]);
+  const [showFunctions, setShowFunctions] = useState(false);
+  const [showAI, setShowAI] = useState(false);
+  const [funcInputs, setFuncInputs] = useState({ x: "", y: "" });
+  // The chained "running result": each function acts on this if it's set, so
+  // ops compose (e.g. xʸ then log). null means no value carried yet.
+  const [funcResult, setFuncResult] = useState<number | null>(null);
+  const [funcTrail, setFuncTrail] = useState<string | null>(null);
+  const [funcHistory, setFuncHistory] = useState<string[]>([]);
+  // Word-problem (DeepSeek) panel: the textarea text, an in-flight flag while
+  // we wait on the server, the worked answer, and any error to surface.
+  const [problem, setProblem] = useState("");
+  const [solving, setSolving] = useState(false);
+  const [answer, setAnswer] = useState<string | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
+  // The raw upstream error body (e.g. Gemini's quota explanation), shown under
+  // the short error message so failures are self-explanatory.
+  const [aiDetail, setAiDetail] = useState<string | null>(null);
   const { calc: state, history } = app;
 
   // Above this width we keep the desktop "floating draggable windows" feel;
@@ -279,6 +308,9 @@ export default function Home() {
   const calcWin = useDraggable({ x: 0, y: 0 }, zRef);
   const historyWin = useDraggable({ x: 360, y: 0 }, zRef);
   const solverWin = useDraggable({ x: 392, y: 48 }, zRef);
+  const functionsWin = useDraggable({ x: 424, y: 96 }, zRef);
+  // Opens to the left of the calculator since its toggle lives top-left.
+  const aiWin = useDraggable({ x: -424, y: 96 }, zRef);
 
   // One entry point for every key, whether clicked or typed.
   function press(key: string) {
@@ -286,12 +318,49 @@ export default function Home() {
     setFlash(key);
   }
 
+  // Send the typed word problem to our own server route, which relays it to
+  // DeepSeek and returns the worked answer. We never call DeepSeek directly
+  // from here — that would leak the API key into the browser.
+  async function solveProblem() {
+    const trimmed = problem.trim();
+    if (trimmed === "" || solving) return; // nothing to do / already running
+
+    setSolving(true);
+    setAiError(null);
+    setAiDetail(null);
+    setAnswer(null);
+    try {
+      const res = await fetch("/api/word-problem", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ problem: trimmed }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAiError(data.error ?? "Something went wrong.");
+        setAiDetail(data.detail ?? null);
+      } else {
+        setAnswer(data.answer);
+      }
+    } catch {
+      setAiError("Network error — is the dev server running?");
+    } finally {
+      setSolving(false);
+    }
+  }
+
   // Listen for real keyboard presses while this component is on screen.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       // Don't hijack keystrokes meant for a text field (e.g. the quadratic
-      // solver's a/b/c inputs) — let them type normally.
-      if (e.target instanceof HTMLInputElement) return;
+      // solver's a/b/c inputs, or the word-problem textarea) — let them type
+      // normally. Inputs and textareas are different element types, so check
+      // both.
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement
+      )
+        return;
 
       const k = e.key;
       let mapped: string | null = null;
@@ -379,6 +448,64 @@ export default function Home() {
     }
   }, [quadHistory]);
 
+  // …and once more for the function-tab history.
+  useEffect(() => {
+    try {
+      const text = localStorage.getItem(STORAGE_KEY_FUNC);
+      if (text) setFuncHistory(JSON.parse(text) as string[]);
+    } catch {
+      // Missing or corrupt → start empty.
+    }
+  }, []);
+
+  const isFirstFuncSave = useRef(true);
+  useEffect(() => {
+    if (isFirstFuncSave.current) {
+      isFirstFuncSave.current = false;
+      return;
+    }
+    try {
+      localStorage.setItem(STORAGE_KEY_FUNC, JSON.stringify(funcHistory));
+    } catch {
+      // Ignore — function history just won't persist.
+    }
+  }, [funcHistory]);
+
+  // Apply one of the four function-tab operations. The two unary ops (ln, log)
+  // act on the running result when one exists, otherwise on the x field — that
+  // single rule is what lets the functions work both independently ("log of 4")
+  // and chained together ("4 squared, then log"). xʸ always reads both fields;
+  // "e" simply loads Euler's number as the running value so it can be fed on.
+  function applyFunc(kind: "pow" | "ln" | "log10" | "e") {
+    const x = parseFloat(funcInputs.x);
+    const y = parseFloat(funcInputs.y);
+    let value: number;
+    let label: string;
+
+    if (kind === "pow") {
+      value = Math.pow(x, y);
+      label = `${format(x)} ^ ${format(y)}`;
+    } else if (kind === "e") {
+      value = Math.E;
+      label = "e";
+    } else {
+      const operand = funcResult !== null ? funcResult : x;
+      const operandLabel = format(operand);
+      if (kind === "ln") {
+        value = Math.log(operand);
+        label = `ln(${operandLabel})`;
+      } else {
+        value = Math.log10(operand);
+        label = `log(${operandLabel})`;
+      }
+    }
+
+    const entry = `${label} = ${format(value)}`;
+    setFuncResult(value);
+    setFuncTrail(entry);
+    setFuncHistory((h) => [entry, ...h].slice(0, HISTORY_LIMIT));
+  }
+
   function keyClass(key: string) {
     if (key === "C") return "key-clear";
     if (key === "=") return "key-equals";
@@ -420,6 +547,58 @@ export default function Home() {
         className="fixed right-3 top-[52px] z-20 flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/5 font-mono text-sm font-semibold text-white/50 backdrop-blur transition-colors hover:border-amber-400/40 hover:text-amber-400/90 sm:right-5 sm:top-[68px] sm:h-10 sm:w-10"
       >
         x²
+      </button>
+
+      {/* Functions toggle (logs / exponents / e), pinned below the solver button */}
+      <button
+        onClick={() => setShowFunctions(true)}
+        aria-label="Functions"
+        className="fixed right-3 top-[92px] z-20 flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/50 backdrop-blur transition-colors hover:border-amber-400/40 hover:text-amber-400/90 sm:right-5 sm:top-[116px] sm:h-10 sm:w-10"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="h-5 w-5"
+        >
+          <path d="M14 2v6a2 2 0 0 0 .245.96l5.51 10.08A2 2 0 0 1 18 22H6a2 2 0 0 1-1.755-2.96l5.51-10.08A2 2 0 0 0 10 8V2" />
+          <path d="M6.453 15h11.094" />
+          <path d="M8.5 2h7" />
+        </svg>
+      </button>
+
+      {/* Word-problem (AI) toggle, pinned to the top-left. A little robot:
+          a rounded rectangle head with two antennas, dot eyes and a smile. */}
+      <button
+        onClick={() => setShowAI(true)}
+        aria-label="Word problems"
+        className="fixed left-3 top-3 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/50 backdrop-blur transition-colors hover:border-amber-400/40 hover:text-amber-400/90 sm:left-5 sm:top-5 sm:h-10 sm:w-10"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="h-5 w-5"
+        >
+          {/* antennas */}
+          <path d="M8 8V5" />
+          <path d="M16 8V5" />
+          <path d="M8 4h0" />
+          <path d="M16 4h0" />
+          {/* head */}
+          <rect x="4" y="8" width="16" height="11" rx="2" />
+          {/* eyes */}
+          <path d="M9 13h0" />
+          <path d="M15 13h0" />
+          {/* smile */}
+          <path d="M9.5 16q2.5 1.6 5 0" />
+        </svg>
       </button>
 
       {/* Calculator: a draggable window on desktop; a centered card on mobile. */}
@@ -479,7 +658,7 @@ export default function Home() {
         <Floating
           isDesktop={isDesktop}
           win={historyWin}
-          width="w-72"
+          width="w-[52rem]"
           onClose={() => setShowHistory(false)}
         >
         <aside className="device flex h-[80vh] max-h-[88vh] w-full flex-col p-5">
@@ -512,6 +691,10 @@ export default function Home() {
             </button>
           </div>
 
+          {/* Three partitions side by side: standard calculations, quadratics,
+              and functions. All columns stretch to the same height and each
+              caps at HISTORY_LIMIT entries. */}
+          <div className="flex min-h-0 flex-1 gap-4">
           {/* Partition 1 — standard calculator history (unchanged format) */}
           <section className="flex min-h-0 flex-1 flex-col">
             <div className="mb-2 flex items-center justify-between px-1">
@@ -545,8 +728,8 @@ export default function Home() {
             )}
           </section>
 
-          {/* Divider between the two partitions */}
-          <div className="my-3 h-px shrink-0 bg-white/10" />
+          {/* Divider between the two side-by-side partitions */}
+          <div className="w-px shrink-0 bg-white/10" />
 
           {/* Partition 2 — quadratic history. Each entry is exactly two lines
               ("ax² + bx + c" then the coefficients) with no gap between
@@ -579,6 +762,44 @@ export default function Home() {
               </div>
             )}
           </section>
+
+          {/* Divider before the third partition */}
+          <div className="w-px shrink-0 bg-white/10" />
+
+          {/* Partition 3 — function history (one line per op, e.g. "ln(16) = …"),
+              newest first, capped at the same HISTORY_LIMIT. */}
+          <section className="flex min-h-0 flex-1 flex-col">
+            <div className="mb-2 flex items-center justify-between px-1">
+              <span className="text-[10px] font-semibold uppercase tracking-[0.25em] text-white/35">
+                Functions
+              </span>
+              {funcHistory.length > 0 && (
+                <button
+                  onClick={() => setFuncHistory([])}
+                  className="text-[10px] uppercase tracking-[0.2em] text-white/30 transition-colors hover:text-rose-400/70"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {funcHistory.length === 0 ? (
+              <div className="flex flex-1 items-center justify-center text-xs uppercase tracking-[0.2em] text-white/25">
+                No functions yet
+              </div>
+            ) : (
+              <ul className="flex-1 space-y-2 overflow-y-auto pr-1">
+                {funcHistory.map((entry, i) => (
+                  <li
+                    key={i}
+                    className="screen truncate px-4 py-3 text-right font-mono text-sm text-emerald-200/70"
+                  >
+                    {entry}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+          </div>
         </aside>
         </Floating>
       )}
@@ -645,12 +866,15 @@ export default function Home() {
               const a = parseFloat(coeffs.a);
               const b = parseFloat(coeffs.b);
               const c = parseFloat(coeffs.c);
-              setRoots(solveQuadratic(a, b, c));
-              // Record a 2-line entry (the form, then the coefficients),
-              // newest first, capped at HISTORY_LIMIT — only once all three
-              // coefficients actually parse to numbers.
+              const solved = solveQuadratic(a, b, c);
+              setRoots(solved);
+              // Record the entry newest-first, capped at HISTORY_LIMIT — only
+              // once all three coefficients actually parse to numbers. Each
+              // entry is the expression with a, b, c substituted in, then the
+              // value(s) of x, then a trailing blank line reserved for a future
+              // second segment.
               if (isFinite(a) && isFinite(b) && isFinite(c)) {
-                const entry = `ax² + bx + c\na = ${format(a)}, b = ${format(b)}, c = ${format(c)}`;
+                const entry = `${formatQuadExpr(a, b, c)}\n${solved}\n`;
                 setQuadHistory((h) => [entry, ...h].slice(0, HISTORY_LIMIT));
               }
             }}
@@ -662,6 +886,169 @@ export default function Home() {
           {roots && (
             <div className="screen mt-4 px-4 py-3 text-right font-mono text-sm text-emerald-200/70">
               {roots}
+            </div>
+          )}
+        </aside>
+        </Floating>
+      )}
+
+      {/* Functions: logarithms, exponents (xʸ) and Euler's number. Enter x and
+          y, then tap an op; each op feeds the running result so they compose. */}
+      {showFunctions && (
+        <Floating
+          isDesktop={isDesktop}
+          win={functionsWin}
+          width="w-72"
+          onClose={() => setShowFunctions(false)}
+        >
+        <aside className="device flex max-h-[80vh] w-full flex-col p-5">
+          <div
+            onPointerDown={isDesktop ? functionsWin.onDragStart : undefined}
+            className={`mb-4 flex touch-none select-none items-center justify-between px-1 ${isDesktop ? "cursor-grab active:cursor-grabbing" : ""}`}
+          >
+            <span className="text-xs font-semibold uppercase tracking-[0.3em] text-amber-500/80">
+              Functions
+            </span>
+            <button
+              onClick={() => setShowFunctions(false)}
+              aria-label="Close functions"
+              className="flex h-7 w-7 items-center justify-center rounded-full text-white/40 transition-colors hover:bg-white/5 hover:text-white/80"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-4 w-4"
+              >
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <p className="mb-4 text-center font-mono text-sm text-emerald-200/50">
+            logarithms · exponents · e
+          </p>
+
+          <div className="space-y-3">
+            {(["x", "y"] as const).map((k) => (
+              <div key={k} className="flex items-center gap-3">
+                <span className="w-4 font-mono text-sm text-white/40">{k}</span>
+                <input
+                  value={funcInputs[k]}
+                  onChange={(e) =>
+                    setFuncInputs((prev) => ({ ...prev, [k]: e.target.value }))
+                  }
+                  placeholder="0"
+                  inputMode="decimal"
+                  className="screen w-full bg-transparent px-4 py-3 text-right font-mono text-lg text-emerald-200/80 outline-none placeholder:text-emerald-200/20"
+                />
+              </div>
+            ))}
+          </div>
+
+          {/* Op buttons. xʸ uses both fields; ln/log act on the running result
+              (or x if none yet); e loads Euler's number. */}
+          <div className="mt-4 grid grid-cols-4 gap-2">
+            <button onClick={() => applyFunc("pow")} className="key key-op h-12 text-base font-medium">xʸ</button>
+            <button onClick={() => applyFunc("ln")} className="key key-op h-12 text-base font-medium">ln</button>
+            <button onClick={() => applyFunc("log10")} className="key key-op h-12 text-base font-medium">log</button>
+            <button onClick={() => applyFunc("e")} className="key key-op h-12 text-base font-medium">e</button>
+          </div>
+
+          {funcTrail && (
+            <div className="screen mt-4 px-4 py-3 text-right font-mono text-sm text-emerald-200/70">
+              {funcTrail}
+            </div>
+          )}
+
+          <button
+            onClick={() => {
+              setFuncResult(null);
+              setFuncTrail(null);
+            }}
+            className="mt-3 self-center text-[10px] uppercase tracking-[0.2em] text-white/30 transition-colors hover:text-rose-400/70"
+          >
+            Reset result
+          </button>
+        </aside>
+        </Floating>
+      )}
+
+      {/* Word problems (AI): a draggable window on desktop, a modal sheet on
+          mobile. Placeholder for now — the DeepSeek-backed solver lands here. */}
+      {showAI && (
+        <Floating
+          isDesktop={isDesktop}
+          win={aiWin}
+          width="w-72"
+          onClose={() => setShowAI(false)}
+        >
+        <aside className="device flex max-h-[80vh] w-full flex-col p-5">
+          <div
+            onPointerDown={isDesktop ? aiWin.onDragStart : undefined}
+            className={`mb-4 flex touch-none select-none items-center justify-between px-1 ${isDesktop ? "cursor-grab active:cursor-grabbing" : ""}`}
+          >
+            <span className="text-xs font-semibold uppercase tracking-[0.3em] text-amber-500/80">
+              Word Problems
+            </span>
+            <button
+              onClick={() => setShowAI(false)}
+              aria-label="Close word problems"
+              className="flex h-7 w-7 items-center justify-center rounded-full text-white/40 transition-colors hover:bg-white/5 hover:text-white/80"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-4 w-4"
+              >
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <p className="mb-3 text-center font-mono text-xs text-emerald-200/40">
+            Describe a problem in words — Gemini solves it.
+          </p>
+
+          {/* The input: a multi-line box for the problem text. */}
+          <textarea
+            value={problem}
+            onChange={(e) => setProblem(e.target.value)}
+            rows={3}
+            placeholder="A train travels 60 miles in 1.5 hours. What is its average speed?"
+            className="screen w-full resize-none bg-transparent px-4 py-3 font-mono text-sm text-emerald-200/80 outline-none placeholder:text-emerald-200/20"
+          />
+
+          {/* Submit. Disabled while a request is in flight or the box is empty. */}
+          <button
+            onClick={solveProblem}
+            disabled={solving || problem.trim() === ""}
+            className="key key-equals mt-3 h-12 w-full text-base font-medium disabled:opacity-40"
+          >
+            {solving ? "Solving…" : "Solve"}
+          </button>
+
+          {/* Result OR error — only one shows at a time. */}
+          {aiError && (
+            <div className="screen mt-3 px-4 py-3 font-mono text-sm text-rose-300/80">
+              <div>{aiError}</div>
+              {aiDetail && (
+                <pre className="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap border-t border-rose-300/15 pt-2 text-[11px] leading-snug text-rose-300/50">
+                  {aiDetail}
+                </pre>
+              )}
+            </div>
+          )}
+          {answer && (
+            <div className="screen mt-3 max-h-48 overflow-y-auto whitespace-pre-line px-4 py-3 font-mono text-sm leading-snug text-emerald-200/70">
+              {answer}
             </div>
           )}
         </aside>
