@@ -13,8 +13,9 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Calculator",
-  description: "A tactile calculator, built step by step with Next.js",
+  title: "CalcU — a calculator you can feel",
+  description:
+    "CalcU brings the heft of desktop hardware to the browser: chained arithmetic, a quadratic solver, scientific functions, history, and a word-problem solver — each in its own draggable window.",
 };
 
 export default function RootLayout({
